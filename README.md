@@ -1,11 +1,6 @@
 # SIEVE_DB: A Lightweight & Fast Page Replacement Policy for Database Bufferpools
 
-SIEVE_DB is a database-aware, scan-resistant page replacement policy for PostgreSQL implemented as part of the paper:
-
-> **[Short Paper] SIEVE_DB: A Lightweight & Fast Page Replacement Policy for Database Bufferpools**
-> Aroma Hoque and Tarikul Islam Papon
-> University of Massachusetts Boston
-> EDBT 2027
+SIEVE_DB is a database-aware, scan-resistant page replacement policy implemented in PostgreSQL 18. It is developed by Aroma Hoque and Tarikul Islam Papon at the University of Massachusetts Boston.
 
 ## Overview
 
