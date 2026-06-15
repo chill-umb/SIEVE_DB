@@ -44,6 +44,7 @@
 #define BUF_REFCOUNT_BITS 18
 #define BUF_USAGECOUNT_BITS 4
 #define BUF_FLAG_BITS 10
+#define POINTER_NOT_IN_QUEUE   (-1)
 
 StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS == 32,
 				 "parts of buffer state space need to equal 32");
@@ -90,6 +91,8 @@ StaticAssertDecl(BM_MAX_USAGE_COUNT < (1 << BUF_USAGECOUNT_BITS),
 				 "BM_MAX_USAGE_COUNT doesn't fit in BUF_USAGECOUNT_BITS bits");
 StaticAssertDecl(MAX_BACKENDS_BITS <= BUF_REFCOUNT_BITS,
 				 "MAX_BACKENDS_BITS needs to be <= BUF_REFCOUNT_BITS");
+
+extern int eviction_algorithm;
 
 /*
  * Buffer tag identifies which disk block the buffer contains.
@@ -264,6 +267,17 @@ BufMappingPartitionLockByIndex(uint32 index)
  */
 typedef struct BufferDesc
 {
+	/* SIEVE / LRU family */
+	int     queuePrev;
+	int     queueNext;
+	bool    visited;
+
+	/* SIEVE_DB */
+	bool sieve_visited;
+	bool sieve_protected;
+	uint64 sieve_protect_unvisited_since_pass;
+
+
 	/*
 	 * ID of page contained in buffer. The buffer header spinlock needs to be
 	 * held to modify this field.

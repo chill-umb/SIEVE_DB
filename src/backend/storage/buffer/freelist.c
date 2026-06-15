@@ -15,20 +15,43 @@
  */
 #include "postgres.h"
 
+#include "utils/guc.h"
+#include "utils/guc_tables.h" 
 #include "pgstat.h"
 #include "port/atomics.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
 
+#include "storage/eviction.h"
+
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
 
+int eviction_algorithm = CLOCK_ALGORITHM;
+
+const struct config_enum_entry eviction_algorithm_options[] = {
+    {"clock",    CLOCK_ALGORITHM,   false},
+	{"sieve",    SIEVE_ALGORITHM,   false},
+    {"sieve_db", SIEVE_DB_ALGORITHM,false},
+    {"lru",      LRU_ALGORITHM,     false},
+    {"cflru",    CFLRU_ALGORITHM,   false},
+	{"lruwsr",   LRUWSR_ALGORITHM,  false},
+    {NULL, 0, false}
+};
 
 /*
  * The shared freelist control information.
  */
 typedef struct
 {
+	int         eviction_algorithm;
+
+	/* Queue-based eviction */
+	int     queueHead;
+	int     queueTail;
+	int     sieveHand;
+
+
 	/* Spinlock: protects the values below */
 	slock_t		buffer_strategy_lock;
 
@@ -51,6 +74,8 @@ typedef struct
 	 * StrategyNotifyBgWriter.
 	 */
 	int			bgwprocno;
+	bool sieve_db_all_protected; // relaxed sieve_db which acts like sieve
+
 } BufferStrategyControl;
 
 /* Pointers to shared state */
@@ -89,6 +114,45 @@ static BufferDesc *GetBufferFromRing(BufferAccessStrategy strategy,
 									 uint32 *buf_state);
 static void AddBufferToRing(BufferAccessStrategy strategy,
 							BufferDesc *buf);
+
+static inline uint32 ClockSweepTick(void);
+static inline uint32 SieveTick(void);
+void SieveOnBufferHit(BufferDesc *buf);
+void SieveOnBufferInsert(BufferDesc *buf);
+void SieveDBOnBufferHit(BufferDesc *buf);
+void SieveDBOnBufferInsert(BufferDesc *buf);
+void LRUOnBufferHit(BufferDesc *buf);
+
+
+/* SIEVE and SIEVE_DB - return next candidate buffer id from SIEVE queue. */
+static inline uint32
+SieveTick(void)
+{
+    uint32      victim;
+    BufferDesc *buf;
+
+    /* Queue must not be empty */
+    Assert(StrategyControl->queueTail != POINTER_NOT_IN_QUEUE);
+
+    if (StrategyControl->sieveHand == POINTER_NOT_IN_QUEUE)
+        StrategyControl->sieveHand = StrategyControl->queueTail;
+
+    victim = (uint32) StrategyControl->sieveHand;
+
+    buf = GetBufferDescriptor(victim);
+
+    /* Move hand backwards (toward older buffers) */
+    StrategyControl->sieveHand = buf->queuePrev;
+
+    /* Wraparound => completed a pass */
+    if (StrategyControl->sieveHand == POINTER_NOT_IN_QUEUE)
+    {
+        StrategyControl->completePasses++;
+        StrategyControl->sieveHand = StrategyControl->queueTail;
+    }
+
+    return victim;
+}
 
 /*
  * ClockSweepTick - Helper routine for StrategyGetBuffer()
@@ -154,6 +218,224 @@ ClockSweepTick(void)
 	}
 	return victim;
 }
+
+//add to MRU (head)
+static void
+AddBufferToQueue(BufferDesc *buf)
+{
+    /* Empty queue */
+    if (StrategyControl->queueHead == POINTER_NOT_IN_QUEUE)
+    {
+        buf->queuePrev = POINTER_NOT_IN_QUEUE;
+        buf->queueNext = POINTER_NOT_IN_QUEUE;
+
+        StrategyControl->queueHead = buf->buf_id;
+        StrategyControl->queueTail = buf->buf_id;
+    }
+    else
+    {
+        BufferDesc *oldHead;
+
+        oldHead = GetBufferDescriptor(StrategyControl->queueHead);
+
+        oldHead->queuePrev = buf->buf_id;
+        buf->queueNext = StrategyControl->queueHead;
+        buf->queuePrev = POINTER_NOT_IN_QUEUE;
+
+        StrategyControl->queueHead = buf->buf_id;
+    }
+}
+
+static void
+RemoveBufferFromQueue(BufferDesc *buf)
+{
+	BufferDesc *prevBuf;
+    BufferDesc *nextBuf;
+
+	/* If not in queue, nothing to do */
+	if (buf->queuePrev == POINTER_NOT_IN_QUEUE &&
+    	buf->queueNext == POINTER_NOT_IN_QUEUE &&
+    	StrategyControl->queueHead != buf->buf_id)   /* head is special case */
+    	return;
+
+    /* Case 1: buffer is in the middle */
+    if (buf->queuePrev != POINTER_NOT_IN_QUEUE &&
+        buf->queueNext != POINTER_NOT_IN_QUEUE)
+    {
+        prevBuf = GetBufferDescriptor(buf->queuePrev);
+        nextBuf = GetBufferDescriptor(buf->queueNext);
+
+        prevBuf->queueNext = buf->queueNext;
+        nextBuf->queuePrev = buf->queuePrev;
+    }
+    /* Case 2: buffer is tail */
+    else if (buf->queuePrev != POINTER_NOT_IN_QUEUE)
+    {
+        prevBuf = GetBufferDescriptor(buf->queuePrev);
+        prevBuf->queueNext = POINTER_NOT_IN_QUEUE;
+        StrategyControl->queueTail = buf->queuePrev;
+    }
+    /* Case 3: buffer is head */
+    else if (buf->queueNext != POINTER_NOT_IN_QUEUE)
+    {
+        nextBuf = GetBufferDescriptor(buf->queueNext);
+        nextBuf->queuePrev = POINTER_NOT_IN_QUEUE;
+        StrategyControl->queueHead = buf->queueNext;
+    }
+    /* Case 4: only element */
+    else
+    {
+        StrategyControl->queueHead = POINTER_NOT_IN_QUEUE;
+        StrategyControl->queueTail = POINTER_NOT_IN_QUEUE;
+        StrategyControl->sieveHand = POINTER_NOT_IN_QUEUE;
+    }
+
+    buf->queuePrev = POINTER_NOT_IN_QUEUE;
+    buf->queueNext = POINTER_NOT_IN_QUEUE;
+}
+
+void
+SieveDBOnBufferHit(BufferDesc *buf)
+{
+    uint32 buf_state;
+
+    if (StrategyControl->eviction_algorithm != SIEVE_DB_ALGORITHM)
+        return;
+
+    buf_state = LockBufHdr(buf);
+    (void) buf_state;
+
+    /* Protect only on 2nd reuse */
+    if (buf->sieve_visited)
+        buf->sieve_protected = true;
+
+    buf->sieve_visited = true;
+
+    /* On any hit, reset “protected-but-unvisited” timer */
+    buf->sieve_protect_unvisited_since_pass = 0;
+
+    UnlockBufHdr(buf);
+}
+
+/*
+ * SieveDBOnBufferInsert
+ *
+ * Called when a buffer is chosen as victim and is about to be reused for a
+ * completely different page (i.e., "miss/new page allocation" path).
+ *
+ * Responsibilities:
+ *   1) Reset SIEVE_DB bits so the new page doesn't inherit hotness.
+ *   2) Place the buffer in the SIEVE queue in your chosen position.
+ */
+void
+SieveDBOnBufferInsert(BufferDesc *buf)
+{
+    if (StrategyControl->eviction_algorithm != SIEVE_DB_ALGORITHM)
+        return;
+
+    SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+    /*
+     * Victim becomes a “new page slot”:
+     * - ensure it is present exactly once in the SIEVE queue
+     * - reset SIEVE_DB metadata
+     */
+	/* Only remove if it is currently in queue */
+    if (buf->queuePrev != POINTER_NOT_IN_QUEUE ||
+        buf->queueNext != POINTER_NOT_IN_QUEUE ||
+        StrategyControl->queueHead == buf->buf_id)
+        RemoveBufferFromQueue(buf);
+
+    AddBufferToQueue(buf);   /* AddBufferToQueue() adds at HEAD */
+
+    /* new page -> forget previous hotness/protection */
+    buf->sieve_visited = false;
+    buf->sieve_protected = false;
+	buf->sieve_protect_unvisited_since_pass = 0;
+
+    SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+}
+
+void
+SieveOnBufferHit(BufferDesc *buf)
+{
+    if (StrategyControl->eviction_algorithm != SIEVE_ALGORITHM)
+        return;
+
+    LockBufHdr(buf);
+
+    buf->visited = true;
+
+    UnlockBufHdr(buf);
+}
+
+void
+SieveOnBufferInsert(BufferDesc *buf)
+{
+    if (StrategyControl->eviction_algorithm != SIEVE_ALGORITHM)
+        return;
+
+    SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+    /* victim becomes the “new x”: must be inserted at head, visited=0 */
+	/* Only remove if it is currently in queue */
+	if (buf->queuePrev != POINTER_NOT_IN_QUEUE ||
+		buf->queueNext != POINTER_NOT_IN_QUEUE ||
+		StrategyControl->queueHead == buf->buf_id)
+		RemoveBufferFromQueue(buf);
+	
+	AddBufferToQueue(buf);   /* AddBufferToQueue() adds at HEAD */
+    buf->visited = false;
+
+    SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+}
+
+/*
+ * LRUOnBufferHit
+ *
+ * On a shared-buffer hit, move the buffer to MRU position in the LRU queue.
+ * Only manipulates queue pointers under buffer_strategy_lock.
+ *
+ *  - This is called after PinBuffer() succeeded (so the buffer is valid/pinned).
+ *  - queuePrev/queueNext are protected by StrategyControl->buffer_strategy_lock.
+ */
+void
+LRUOnBufferHit(BufferDesc *buf)
+{
+	if (StrategyControl->eviction_algorithm != LRU_ALGORITHM && 
+		StrategyControl->eviction_algorithm != CFLRU_ALGORITHM &&
+		StrategyControl->eviction_algorithm != LRUWSR_ALGORITHM)
+		return;
+
+	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+	/* Already MRU/head? (Optional fast path; safe to omit) */
+	if (StrategyControl->queueHead == buf->buf_id)
+	{
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+		return;
+	}
+
+	/*
+	 * If buffer isn't currently in the queue, just enqueue it as MRU.
+	 * (This can happen if your code temporarily removes buffers, or if
+	 * you haven't yet inserted all buffers into the queue at init.)
+	 */
+	if (buf->queuePrev == POINTER_NOT_IN_QUEUE &&
+		buf->queueNext == POINTER_NOT_IN_QUEUE)
+	{
+		AddBufferToQueue(buf);
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+		return;
+	}
+
+	/* Move to MRU/head */
+	RemoveBufferFromQueue(buf);
+	AddBufferToQueue(buf);
+
+	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+}
+
 
 /*
  * StrategyGetBuffer
@@ -226,83 +508,562 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 	 */
 	pg_atomic_fetch_add_u32(&StrategyControl->numBufferAllocs, 1);
 
-	/* Use the "clock sweep" algorithm to find a free buffer */
-	trycounter = NBuffers;
-	for (;;)
+	if (StrategyControl->eviction_algorithm == CLOCK_ALGORITHM)
 	{
-		uint32		old_buf_state;
-		uint32		local_buf_state;
-
-		buf = GetBufferDescriptor(ClockSweepTick());
-
-		/*
-		 * Check whether the buffer can be used and pin it if so. Do this
-		 * using a CAS loop, to avoid having to lock the buffer header.
-		 */
-		old_buf_state = pg_atomic_read_u32(&buf->state);
+		/* Use the "clock sweep" algorithm to find a free buffer */
+		trycounter = NBuffers;
 		for (;;)
 		{
-			local_buf_state = old_buf_state;
+			uint32		old_buf_state;
+			uint32		local_buf_state;
+
+			buf = GetBufferDescriptor(ClockSweepTick());
 
 			/*
-			 * If the buffer is pinned or has a nonzero usage_count, we cannot
-			 * use it; decrement the usage_count (unless pinned) and keep
-			 * scanning.
-			 */
-
-			if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0)
+			* Check whether the buffer can be used and pin it if so. Do this
+			* using a CAS loop, to avoid having to lock the buffer header.
+			*/
+			old_buf_state = pg_atomic_read_u32(&buf->state);
+			for (;;)
 			{
-				if (--trycounter == 0)
+				local_buf_state = old_buf_state;
+
+				/*
+				* If the buffer is pinned or has a nonzero usage_count, we cannot
+				* use it; decrement the usage_count (unless pinned) and keep
+				* scanning.
+				*/
+
+				if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0)
 				{
-					/*
-					 * We've scanned all the buffers without making any state
-					 * changes, so all the buffers are pinned (or were when we
-					 * looked at them). We could hope that someone will free
-					 * one eventually, but it's probably better to fail than
-					 * to risk getting stuck in an infinite loop.
-					 */
-					elog(ERROR, "no unpinned buffers available");
-				}
-				break;
-			}
-
-			/* See equivalent code in PinBuffer() */
-			if (unlikely(local_buf_state & BM_LOCKED))
-			{
-				old_buf_state = WaitBufHdrUnlocked(buf);
-				continue;
-			}
-
-			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
-			{
-				local_buf_state -= BUF_USAGECOUNT_ONE;
-
-				if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state,
-												   local_buf_state))
-				{
-					trycounter = NBuffers;
+					if (--trycounter == 0)
+					{
+						/*
+						* We've scanned all the buffers without making any state
+						* changes, so all the buffers are pinned (or were when we
+						* looked at them). We could hope that someone will free
+						* one eventually, but it's probably better to fail than
+						* to risk getting stuck in an infinite loop.
+						*/
+						elog(ERROR, "no unpinned buffers available");
+					}
 					break;
 				}
-			}
-			else
-			{
-				/* pin the buffer if the CAS succeeds */
-				local_buf_state += BUF_REFCOUNT_ONE;
 
-				if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state,
-												   local_buf_state))
+				/* See equivalent code in PinBuffer() */
+				if (unlikely(local_buf_state & BM_LOCKED))
 				{
-					/* Found a usable buffer */
-					if (strategy != NULL)
-						AddBufferToRing(strategy, buf);
-					*buf_state = local_buf_state;
+					old_buf_state = WaitBufHdrUnlocked(buf);
+					continue;
+				}
 
-					TrackNewBufferPin(BufferDescriptorGetBuffer(buf));
+				if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
+				{
+					local_buf_state -= BUF_USAGECOUNT_ONE;
 
-					return buf;
+					if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state,
+													local_buf_state))
+					{
+						trycounter = NBuffers;
+						break;
+					}
+				}
+				else
+				{
+					/* pin the buffer if the CAS succeeds */
+					local_buf_state += BUF_REFCOUNT_ONE;
+
+					if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state,
+													local_buf_state))
+					{
+						/* Found a usable buffer */
+						if (strategy != NULL)
+							AddBufferToRing(strategy, buf);
+						*buf_state = local_buf_state;
+
+						TrackNewBufferPin(BufferDescriptorGetBuffer(buf));						
+						return buf;
+					}
 				}
 			}
 		}
+	}
+
+	else if (StrategyControl->eviction_algorithm == SIEVE_ALGORITHM)
+	{
+		for (;;)
+		{
+			uint32 local_buf_state;
+
+			/* Pick a candidate from SIEVE queue */
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+			buf = GetBufferDescriptor(SieveTick());
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			/* Examine candidate buffer - MUST use lock to check/modify visited bit */
+			local_buf_state = LockBufHdr(buf);
+
+			/* Skip pinned buffers */
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0)
+			{
+				UnlockBufHdr(buf);
+				continue;
+			}
+
+			/*
+			* SIEVE eviction logic:
+			* - If visited: clear the bit and continue searching
+			* - If not visited: this is our victim
+			*/
+			if (buf->visited)
+			{
+				/* Clear visited bit and give it a second chance */
+				buf->visited = false;
+				UnlockBufHdr(buf);
+				continue;
+			}
+
+			/* === Victim selected === */
+			/* Buffer is unpinned and unvisited - evict it */
+			
+			Assert(local_buf_state & BM_LOCKED);
+			
+			/* Pin the buffer (increment refcount to 1) and unlock */
+			UnlockBufHdrExt(buf, local_buf_state, 0, 0, 1);
+
+			/* Read final state after unlock */
+			local_buf_state = pg_atomic_read_u32(&buf->state);
+			*buf_state = local_buf_state;
+
+			if (strategy != NULL)
+				AddBufferToRing(strategy, buf);
+
+			TrackNewBufferPin(BufferDescriptorGetBuffer(buf));
+			return buf;
+		}
+	}
+	else if (StrategyControl->eviction_algorithm == SIEVE_DB_ALGORITHM)
+	{
+		for (;;)
+		{
+			uint32 local_buf_state;
+			uint64 cur_pass;
+
+			/* Pick a candidate from SIEVE queue */
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+			cur_pass = StrategyControl->completePasses;
+			buf = GetBufferDescriptor(SieveTick());
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			/* Examine candidate buffer.	*/
+			local_buf_state = LockBufHdr(buf);
+
+			/* Skip pinned buffers */
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0)
+			{
+				UnlockBufHdr(buf);
+				continue;
+			}
+
+			/*
+			* SIEVE_DB eviction sweep
+			*/
+			if (buf->sieve_visited)
+			{
+				buf->sieve_visited = false;
+
+				/* If it's protected, it just became unvisited, start aging timer */
+				if (buf->sieve_protected)
+					buf->sieve_protect_unvisited_since_pass = cur_pass;
+
+				UnlockBufHdr(buf);
+				continue;
+			}
+
+			if (buf->sieve_protected)
+			{
+				/* Only age out protection if it's currently unvisited */
+				if (!buf->sieve_visited)
+				{
+					if (buf->sieve_protect_unvisited_since_pass == 0)
+						buf->sieve_protect_unvisited_since_pass = cur_pass;
+
+					if (cur_pass - buf->sieve_protect_unvisited_since_pass >= 3)
+					{
+						buf->sieve_protected = false;
+						buf->sieve_protect_unvisited_since_pass = 0;
+						/* now it can fall through and be evictable soon */
+					}
+					else
+					{
+						UnlockBufHdr(buf);
+						continue;
+					}
+				}
+				else
+				{
+					/* If it’s visited again, stop the “unvisited protected” timer */
+					buf->sieve_protect_unvisited_since_pass = 0;
+					UnlockBufHdr(buf);
+					continue;
+				}
+			}
+
+			/* === Victim selected === */
+			/*
+			* We currently hold the buffer header lock (BM_LOCKED is set in local_buf_state).
+			* Contract for GetVictimBuffer():
+			*   - return buffer pinned (refcount==1)
+			*   - header lock must be released before return
+			*/
+			/* Sanity: still unpinned */
+			Assert(local_buf_state & BM_LOCKED);
+
+			UnlockBufHdrExt(buf, local_buf_state, 0, 0, 1);
+
+			local_buf_state = pg_atomic_read_u32(&buf->state);
+			*buf_state = local_buf_state;
+
+			if (strategy != NULL)
+				AddBufferToRing(strategy, buf);
+
+			TrackNewBufferPin(BufferDescriptorGetBuffer(buf));
+			return buf;
+		}
+	}
+	else if (StrategyControl->eviction_algorithm == LRU_ALGORITHM)
+	{
+		uint32  cur_idx;
+		uint32  local_buf_state;
+
+		trycounter = NBuffers;
+
+		/* Start from LRU tail, under strategy lock */
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		cur_idx = StrategyControl->queueTail;
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+		for (;;)
+		{
+			BufferDesc *cur;
+			uint32      next_idx;
+
+			cur = GetBufferDescriptor(cur_idx);
+			local_buf_state = LockBufHdr(cur);
+
+			/* Unpinned candidate found */
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				/*
+				* Promote to MRU: queue manipulation happens under
+				* buffer_strategy_lock.
+				*/
+				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+				RemoveBufferFromQueue(cur);
+				AddBufferToQueue(cur);
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+				/* Upgrade this candidate into a pinned victim */
+				UnlockBufHdrExt(cur, local_buf_state, 0, 0, 1);
+
+				local_buf_state = pg_atomic_read_u32(&cur->state);
+				/* Another backend may have BM_LOCKED again; just ensure we have a pin */
+				Assert(BUF_STATE_GET_REFCOUNT(local_buf_state) >= 1);
+
+				*buf_state = local_buf_state;
+
+				if (strategy != NULL)
+					AddBufferToRing(strategy, cur);
+
+				TrackNewBufferPin(BufferDescriptorGetBuffer(cur));
+				return cur;
+			}
+
+			/* pinned — skip */
+			UnlockBufHdr(cur);
+
+			if (--trycounter == 0)
+				elog(ERROR, "no unpinned buffers available");
+
+			/* Advance LRU-wards safely under strategy lock */
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+			if (cur->queuePrev == POINTER_NOT_IN_QUEUE)
+				next_idx = StrategyControl->queueTail;
+			else
+				next_idx = cur->queuePrev;
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			cur_idx = next_idx;
+		}
+	}
+	else if (StrategyControl->eviction_algorithm == CFLRU_ALGORITHM)
+	{
+		int     cold_scan = NBuffers / 3;
+		uint32  cur_idx;
+		BufferDesc *cur;
+		uint32  local_buf_state;
+
+		trycounter = NBuffers;
+
+		/*
+		* PHASE 1: scan the cold region (tail direction) but skip dirty pages.
+		* Start from LRU tail, under strategy lock.
+		*/
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		cur_idx = StrategyControl->queueTail;
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+		for (int i = 0; i < cold_scan; i++)
+		{
+			uint32 next_idx;
+
+			cur = GetBufferDescriptor(cur_idx);
+			local_buf_state = LockBufHdr(cur);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				/* Skip dirty pages in CFLRU cold region */
+				if (local_buf_state & BM_DIRTY)
+				{
+					UnlockBufHdr(cur);
+
+					/* advance to previous (LRU-wards) safely */
+					SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+					if (cur->queuePrev == POINTER_NOT_IN_QUEUE)
+						next_idx = StrategyControl->queueTail;
+					else
+						next_idx = cur->queuePrev;
+					SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+					cur_idx = next_idx;
+					continue;
+				}
+
+				/* Unpinned clean candidate found */
+				/* queue update: promote to MRU */
+				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+				RemoveBufferFromQueue(cur);
+				AddBufferToQueue(cur);
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+				/* upgrade to pinned + unlock header */
+				UnlockBufHdrExt(cur, local_buf_state, 0, 0, 1);
+
+				local_buf_state = pg_atomic_read_u32(&cur->state);
+				Assert(BUF_STATE_GET_REFCOUNT(local_buf_state) >= 1);
+
+				*buf_state = local_buf_state;
+
+				if (strategy != NULL)
+					AddBufferToRing(strategy, cur);
+
+				TrackNewBufferPin(BufferDescriptorGetBuffer(cur));
+				return cur;
+			}
+
+			/* pinned → skip */
+			UnlockBufHdr(cur);
+
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+			if (cur->queuePrev == POINTER_NOT_IN_QUEUE)
+				next_idx = StrategyControl->queueTail;
+			else
+				next_idx = cur->queuePrev;
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			cur_idx = next_idx;
+		}
+
+		/*
+		* PHASE 2: fallback to full LRU scan if the cold region yielded nothing.
+		*/
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		cur_idx = StrategyControl->queueTail;
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+		for (;;)
+		{
+			uint32 next_idx;
+
+			cur = GetBufferDescriptor(cur_idx);
+			local_buf_state = LockBufHdr(cur);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				/* promote to MRU */
+				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+				RemoveBufferFromQueue(cur);
+				AddBufferToQueue(cur);
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+				UnlockBufHdrExt(cur, local_buf_state, 0, 0, 1);
+
+				local_buf_state = pg_atomic_read_u32(&cur->state);
+				Assert(BUF_STATE_GET_REFCOUNT(local_buf_state) >= 1);
+
+				*buf_state = local_buf_state;
+
+				if (strategy != NULL)
+					AddBufferToRing(strategy, cur);
+
+				TrackNewBufferPin(BufferDescriptorGetBuffer(cur));
+				return cur;
+			}
+
+			UnlockBufHdr(cur);
+
+			if (--trycounter == 0)
+				elog(ERROR, "no unpinned buffers available");
+
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+			if (cur->queuePrev == POINTER_NOT_IN_QUEUE)
+				next_idx = StrategyControl->queueTail;
+			else
+				next_idx = cur->queuePrev;
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			cur_idx = next_idx;
+		}
+	}
+	else if (StrategyControl->eviction_algorithm == LRUWSR_ALGORITHM)
+	{
+		uint32  cur_idx;
+		uint32  local_buf_state;
+
+		trycounter = NBuffers;
+
+		/* Start from LRU tail, under strategy lock */
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		cur_idx = StrategyControl->queueTail;
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+		for (;;)
+		{
+			BufferDesc *cur;
+			uint32      next_idx;
+
+			cur = GetBufferDescriptor(cur_idx);
+			local_buf_state = LockBufHdr(cur);
+
+			// if (unlikely(local_buf_state & BM_LOCKED))
+			// {
+			// 	UnlockBufHdr(cur);
+			// 	/* wait until unlocked, then retry same cur_idx */
+			// 	(void) WaitBufHdrUnlocked(cur);
+			// 	continue;
+			// }
+
+			/*
+			* If pinned, we can't touch it (including WSR aging); just skip.
+			*/
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0)
+			{
+				UnlockBufHdr(cur);
+
+				if (--trycounter == 0)
+					elog(ERROR, "no unpinned buffers available");
+
+				/* Advance LRU-wards safely under strategy lock */
+				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+				if (cur->queuePrev == POINTER_NOT_IN_QUEUE)
+					next_idx = StrategyControl->queueTail;
+				else
+					next_idx = cur->queuePrev;
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+				cur_idx = next_idx;
+				continue;
+			}
+
+			/*
+			* WSR rule:
+			* If buffer is dirty AND has usage_count > 0,
+			* zero out usage_count and push toward MRU (aging), then continue.
+			*/
+			if ((local_buf_state & BM_TAG_VALID) &&
+				(local_buf_state & BM_DIRTY) &&
+				BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
+			{
+				/* Move on (from current's prev; recompute safely) */
+				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+				if (cur->queuePrev == POINTER_NOT_IN_QUEUE)
+					next_idx = StrategyControl->queueTail;
+				else
+					next_idx = cur->queuePrev;
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+				/* Compute the new state: same, but usagecount -> 0 */
+				//int uc = BUF_STATE_GET_USAGECOUNT(local_buf_state);
+
+				/* Release header lock while setting usagecount delta */
+				//UnlockBufHdrExt(cur, local_buf_state, 0, -uc, 0);
+
+				/* zero usage_count safely */
+				for (;;)
+				{
+					uint32 old_state = local_buf_state;
+					uint32 old_uc = BUF_STATE_GET_USAGECOUNT(old_state);
+
+					if (old_uc == 0)
+						break;
+
+					uint32 new_state =
+						old_state -
+						(old_uc * BUF_USAGECOUNT_ONE);
+
+					if (pg_atomic_compare_exchange_u32(&cur->state,
+													&old_state,
+													new_state))
+						break;
+
+					local_buf_state = old_state;
+				}
+
+				UnlockBufHdr(cur);
+
+				/* Promote to MRU under strategy lock */
+				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+				RemoveBufferFromQueue(cur);
+				AddBufferToQueue(cur);
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+				/* count this as "made progress" like clock does */
+				trycounter = NBuffers;
+
+				cur_idx = next_idx;
+				continue;
+			}
+	
+
+			/*
+			* Unpinned candidate found (and either clean or usagecount==0).
+			*/
+
+			/* promote to MRU */
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+			RemoveBufferFromQueue(cur);
+			AddBufferToQueue(cur);
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			/* Pin and return */
+			UnlockBufHdrExt(cur, local_buf_state, 0, 0, 1);
+
+			local_buf_state = pg_atomic_read_u32(&cur->state);
+			Assert(BUF_STATE_GET_REFCOUNT(local_buf_state) >= 1);
+
+			*buf_state = local_buf_state;
+
+			if (strategy != NULL)
+				AddBufferToRing(strategy, cur);
+
+			TrackNewBufferPin(BufferDescriptorGetBuffer(cur));
+			return cur;
+
+		}
+	}
+	else
+	{
+		elog(ERROR, "unknown eviction algorithm");
 	}
 }
 
@@ -431,6 +1192,19 @@ StrategyInitialize(bool init)
 
 		SpinLockInit(&StrategyControl->buffer_strategy_lock);
 
+		/* Copy enum GUC directly */
+    	StrategyControl->eviction_algorithm = eviction_algorithm;
+
+		/* SIEVE and LRU initial state (flags, counters, queues, etc.) */
+		StrategyControl->queueHead = POINTER_NOT_IN_QUEUE;
+		StrategyControl->queueTail = POINTER_NOT_IN_QUEUE;
+		StrategyControl->sieveHand = POINTER_NOT_IN_QUEUE;
+
+		/* SIEVE_DB initial state (flags, counters, queues, etc.) */
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		StrategyControl->sieve_db_all_protected = false;
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
 		/* Initialize the clock-sweep pointer */
 		pg_atomic_init_u32(&StrategyControl->nextVictimBuffer, 0);
 
@@ -440,6 +1214,15 @@ StrategyInitialize(bool init)
 
 		/* No pending notification */
 		StrategyControl->bgwprocno = -1;
+
+		for (int i = 0; i < NBuffers; i++)
+		{
+			BufferDesc *buf = GetBufferDescriptor(i);
+			buf->queuePrev = POINTER_NOT_IN_QUEUE;
+			buf->queueNext = POINTER_NOT_IN_QUEUE;
+			buf->visited   = false;
+			AddBufferToQueue(buf);
+		}
 	}
 	else
 		Assert(!init);

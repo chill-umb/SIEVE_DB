@@ -105,7 +105,7 @@ enum config_group
 };
 
 /*
- * Stack entry for saving the state a variable had prior to an uncommitted
+ * Stack entry ffor saving the state a variable had prior to an uncommitted
  * transactional change
  */
 typedef enum

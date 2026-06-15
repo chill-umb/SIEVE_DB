@@ -36,6 +36,7 @@
 
 #include <sys/file.h>
 #include <unistd.h>
+#include "storage/eviction.h"
 
 #include "access/tableam.h"
 #include "access/xloginsert.h"
@@ -66,6 +67,7 @@
 #include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
+#include "storage/eviction.h"
 
 
 /* Note: these two macros only work on shared buffers, not local ones! */
@@ -89,6 +91,14 @@
  * the buffers by doing lookups in BufMapping table.
  */
 #define BUF_DROP_FULL_SCAN_THRESHOLD		(uint64) (NBuffers / 32)
+
+
+extern void SieveDBOnBufferHit(BufferDesc *buf);
+extern void SieveOnBufferHit(BufferDesc *buf);
+extern void SieveOnBufferInsert(BufferDesc *buf);
+extern void SieveDBOnBufferInsert(BufferDesc *buf);
+extern void LRUOnBufferHit(BufferDesc *buf);
+
 
 typedef struct PrivateRefCountEntry
 {
@@ -2020,6 +2030,21 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 		valid = PinBuffer(buf, strategy, false);
 
+		// Buffer Hit operations
+		if (valid && strategy == NULL)
+		{
+			uint32 st = pg_atomic_read_u32(&buf->state);
+
+			/* Only do queue/hit logic on buffers that are fully tagged and not in IO */
+			if ((st & BM_TAG_VALID) && !(st & BM_IO_IN_PROGRESS) && !(st & BM_LOCKED))
+			{
+				SieveDBOnBufferHit(buf);
+				SieveOnBufferHit(buf);
+				LRUOnBufferHit(buf);
+			}
+		}
+		
+
 		/* Can release the mapping lock as soon as we've pinned it */
 		LWLockRelease(newPartitionLock);
 
@@ -2082,6 +2107,20 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 		valid = PinBuffer(existing_buf_hdr, strategy, false);
 
+		// Buffer Hit operations
+		if (valid && strategy == NULL)
+		{
+			uint32 st = pg_atomic_read_u32(&existing_buf_hdr->state);
+
+			/* Only do queue/hit logic on buffers that are fully tagged and not in IO */
+			if ((st & BM_TAG_VALID) && !(st & BM_IO_IN_PROGRESS) && !(st & BM_LOCKED))
+			{
+				SieveDBOnBufferHit(existing_buf_hdr);
+				SieveOnBufferHit(existing_buf_hdr);
+				LRUOnBufferHit(existing_buf_hdr);
+			}
+		}
+
 		/* Can release the mapping lock as soon as we've pinned it */
 		LWLockRelease(newPartitionLock);
 
@@ -2110,6 +2149,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	Assert(!(victim_buf_state & (BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_IO_IN_PROGRESS)));
 
 	victim_buf_hdr->tag = newTag;
+
+	// sieve and sieve_db
+	SieveOnBufferInsert(victim_buf_hdr);
+	SieveDBOnBufferInsert(victim_buf_hdr);
 
 	/*
 	 * Make sure BM_PERMANENT is set for buffers that must be written at every

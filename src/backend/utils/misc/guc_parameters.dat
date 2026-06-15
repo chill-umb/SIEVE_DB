@@ -1001,6 +1001,17 @@
   boot_val => 'true',
 },
 
+{
+    name        => 'eviction_algorithm',
+    type        => 'enum',
+    context     => 'PGC_POSTMASTER',
+    group       => 'RESOURCES_MEM',
+    short_desc  => 'Sets the buffer pool eviction algorithm.',
+    boot_val => 'CLOCK_ALGORITHM',
+    variable    => 'eviction_algorithm',
+    options     => 'eviction_algorithm_options',
+},
+
 { name => 'exit_on_error', type => 'bool', context => 'PGC_USERSET', group => 'ERROR_HANDLING_OPTIONS',
   short_desc => 'Terminate session on any error.',
   variable => 'ExitOnAnyError',

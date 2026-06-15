@@ -20,6 +20,8 @@
  */
 #include "postgres.h"
 
+#include "storage/eviction.h"
+
 #ifdef HAVE_COPYFILE_H
 #include <copyfile.h>
 #endif
@@ -110,6 +112,8 @@
 #ifndef PG_KRB_SRVTAB
 #define PG_KRB_SRVTAB ""
 #endif
+
+extern const struct config_enum_entry eviction_algorithm_options[];
 
 /*
  * Options for enum values defined in this module.

@@ -127,6 +127,11 @@ BufferManagerShmemInit(void)
 			buf->buf_id = i;
 
 			pgaio_wref_clear(&buf->io_wref);
+			
+			// Sieve and Sieve_db
+			buf->visited = false;
+			buf->sieve_visited = false;
+    		buf->sieve_protected = false;
 
 			LWLockInitialize(BufferDescriptorGetContentLock(buf),
 							 LWTRANCHE_BUFFER_CONTENT);
