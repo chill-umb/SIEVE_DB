@@ -13,3 +13,9 @@ compile_commands.json
 *.log
 *.png
 pgdata/
+objfiles.txt
+*.pc
+*.so
+*.so.*
+*.dylib
+src/interfaces/
