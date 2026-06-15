@@ -182,9 +182,9 @@ Experiments were conducted on two bare-metal nodes on [Chameleon Cloud](https://
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `eviction_algorithm` | `clock` | Active eviction policy |
-| Protection age `A` | `2` | Number of complete buffer pool passes before protection expires |
+| Protection age `A` | `3` | Number of complete buffer pool passes before protection expires |
 
-The protection age `A` controls the tradeoff between write efficiency and eviction aggressiveness. `A=2` is recommended as it achieves the best throughput with meaningful write reduction across both OLTP and scan-heavy workloads.
+The protection age `A` controls the tradeoff between write efficiency and eviction aggressiveness.
 
 ## Citation
 
