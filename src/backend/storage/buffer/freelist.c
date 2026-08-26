@@ -36,6 +36,8 @@ const struct config_enum_entry eviction_algorithm_options[] = {
     {"lru",      LRU_ALGORITHM,     false},
     {"cflru",    CFLRU_ALGORITHM,   false},
 	{"lruwsr",   LRUWSR_ALGORITHM,  false},
+	{"sieve_protected", SIEVE_PROTECTED_ALGORITHM, false},
+	{"clock2bit",       CLOCK_2BIT_ALGORITHM,      false},
     {NULL, 0, false}
 };
 
@@ -122,6 +124,9 @@ void SieveOnBufferInsert(BufferDesc *buf);
 void SieveDBOnBufferHit(BufferDesc *buf);
 void SieveDBOnBufferInsert(BufferDesc *buf);
 void LRUOnBufferHit(BufferDesc *buf);
+void SieveProtectedOnBufferHit(BufferDesc *buf);
+void SieveProtectedOnBufferInsert(BufferDesc *buf);
+int  GetUsageCountCap(void);
 
 
 /* SIEVE and SIEVE_DB - return next candidate buffer id from SIEVE queue. */
@@ -356,6 +361,72 @@ SieveDBOnBufferInsert(BufferDesc *buf)
     SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 }
 
+/*
+ * SieveProtectedOnBufferHit
+ *
+ * SIEVE_PROTECTED_ALGORITHM: same "protect on 2nd reuse" rule as SIEVE_DB,
+ * but with NO aging/pass-counter mechanism. Reuses the sieve_visited /
+ * sieve_protected fields (safe because only one algorithm is active per
+ * running instance).
+ */
+void
+SieveProtectedOnBufferHit(BufferDesc *buf)
+{
+    if (StrategyControl->eviction_algorithm != SIEVE_PROTECTED_ALGORITHM)
+        return;
+
+    LockBufHdr(buf);
+
+    if (buf->sieve_visited)
+        buf->sieve_protected = true;
+
+    buf->sieve_visited = true;
+
+    UnlockBufHdr(buf);
+}
+
+/*
+ * SieveProtectedOnBufferInsert
+ *
+ * Victim becomes a new page slot: reset both bits, re-queue at head.
+ */
+void
+SieveProtectedOnBufferInsert(BufferDesc *buf)
+{
+    if (StrategyControl->eviction_algorithm != SIEVE_PROTECTED_ALGORITHM)
+        return;
+
+    SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+    if (buf->queuePrev != POINTER_NOT_IN_QUEUE ||
+        buf->queueNext != POINTER_NOT_IN_QUEUE ||
+        StrategyControl->queueHead == buf->buf_id)
+        RemoveBufferFromQueue(buf);
+
+    AddBufferToQueue(buf);
+
+    buf->sieve_visited = false;
+    buf->sieve_protected = false;
+
+    SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+}
+
+/*
+ * GetUsageCountCap
+ *
+ * CLOCK_2BIT_ALGORITHM shares the buf_state usage_count field with the
+ * default CLOCK, capped at CLOCK_2BIT_MAX_USAGE_COUNT (3) instead of
+ * BM_MAX_USAGE_COUNT (5).
+ */
+int
+GetUsageCountCap(void)
+{
+    if (StrategyControl->eviction_algorithm == CLOCK_2BIT_ALGORITHM)
+        return CLOCK_2BIT_MAX_USAGE_COUNT;
+
+    return BM_MAX_USAGE_COUNT;
+}
+
 void
 SieveOnBufferHit(BufferDesc *buf)
 {
@@ -508,9 +579,15 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 	 */
 	pg_atomic_fetch_add_u32(&StrategyControl->numBufferAllocs, 1);
 
-	if (StrategyControl->eviction_algorithm == CLOCK_ALGORITHM)
+	if (StrategyControl->eviction_algorithm == CLOCK_ALGORITHM ||
+	StrategyControl->eviction_algorithm == CLOCK_2BIT_ALGORITHM)
 	{
-		/* Use the "clock sweep" algorithm to find a free buffer */
+		/*
+		 * Use the "clock sweep" algorithm to find a free buffer.
+		 * CLOCK_2BIT_ALGORITHM shares this exact sweep - only the
+		 * usage_count cap applied on hit differs (see GetUsageCountCap()
+		 * in freelist.c and PinBuffer() in bufmgr.c).
+		 */
 		trycounter = NBuffers;
 		for (;;)
 		{
@@ -642,6 +719,58 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			return buf;
 		}
 	}
+	else if (StrategyControl->eviction_algorithm == SIEVE_PROTECTED_ALGORITHM)
+	{
+		for (;;)
+		{
+			uint32 local_buf_state;
+
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+			buf = GetBufferDescriptor(SieveTick());
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			local_buf_state = LockBufHdr(buf);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0)
+			{
+				UnlockBufHdr(buf);
+				continue;
+			}
+
+			/*
+			 * No aging: a protected-but-unvisited page gets exactly one
+			 * free pass (protection bit cleared, not evicted), then is
+			 * evictable like any other buffer.
+			 */
+			if (buf->sieve_visited)
+			{
+				buf->sieve_visited = false;
+				UnlockBufHdr(buf);
+				continue;
+			}
+
+			if (buf->sieve_protected)
+			{
+				buf->sieve_protected = false;
+				UnlockBufHdr(buf);
+				continue;
+			}
+
+			Assert(local_buf_state & BM_LOCKED);
+
+			UnlockBufHdrExt(buf, local_buf_state, 0, 0, 1);
+
+			local_buf_state = pg_atomic_read_u32(&buf->state);
+			*buf_state = local_buf_state;
+
+			if (strategy != NULL)
+				AddBufferToRing(strategy, buf);
+
+			TrackNewBufferPin(BufferDescriptorGetBuffer(buf));
+			return buf;
+		}
+	}
+
 	else if (StrategyControl->eviction_algorithm == SIEVE_DB_ALGORITHM)
 	{
 		for (;;)
