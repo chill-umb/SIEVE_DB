@@ -98,6 +98,9 @@ extern void SieveOnBufferHit(BufferDesc *buf);
 extern void SieveOnBufferInsert(BufferDesc *buf);
 extern void SieveDBOnBufferInsert(BufferDesc *buf);
 extern void LRUOnBufferHit(BufferDesc *buf);
+extern void SieveProtectedOnBufferHit(BufferDesc *buf);
+extern void SieveProtectedOnBufferInsert(BufferDesc *buf);
+extern int  GetUsageCountCap(void);
 
 
 typedef struct PrivateRefCountEntry
@@ -2041,6 +2044,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 				SieveDBOnBufferHit(buf);
 				SieveOnBufferHit(buf);
 				LRUOnBufferHit(buf);
+				SieveProtectedOnBufferHit(buf);
 			}
 		}
 		
@@ -2118,6 +2122,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 				SieveDBOnBufferHit(existing_buf_hdr);
 				SieveOnBufferHit(existing_buf_hdr);
 				LRUOnBufferHit(existing_buf_hdr);
+				SieveProtectedOnBufferHit(existing_buf_hdr);
 			}
 		}
 
@@ -2153,6 +2158,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	// sieve and sieve_db
 	SieveOnBufferInsert(victim_buf_hdr);
 	SieveDBOnBufferInsert(victim_buf_hdr);
+	SieveProtectedOnBufferInsert(victim_buf_hdr);
 
 	/*
 	 * Make sure BM_PERMANENT is set for buffers that must be written at every
@@ -3145,8 +3151,13 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
 
 			if (strategy == NULL)
 			{
-				/* Default case: increase usagecount unless already max. */
-				if (BUF_STATE_GET_USAGECOUNT(buf_state) < BM_MAX_USAGE_COUNT)
+				/*
+				 * Default case: increase usagecount unless already at cap.
+				 * GetUsageCountCap() returns BM_MAX_USAGE_COUNT (5) except
+				 * for CLOCK_2BIT_ALGORITHM, which caps at 3 to emulate a
+				 * 2-bit reference count in the same buf_state field.
+				 */
+				if (BUF_STATE_GET_USAGECOUNT(buf_state) < GetUsageCountCap())
 					buf_state += BUF_USAGECOUNT_ONE;
 			}
 			else
