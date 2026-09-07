@@ -275,7 +275,7 @@ typedef struct BufferDesc
 	/* SIEVE_DB */
 	bool sieve_visited;
 	bool sieve_protected;
-	uint64 sieve_protect_unvisited_since_pass;
+	uint8 sieve_protect_unvisited_since_pass;
 
 
 	/*
