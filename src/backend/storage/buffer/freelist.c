@@ -776,11 +776,11 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		for (;;)
 		{
 			uint32 local_buf_state;
-			uint64 cur_pass;
+			uint8 cur_pass;
 
 			/* Pick a candidate from SIEVE queue */
 			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
-			cur_pass = StrategyControl->completePasses;
+			cur_pass = (uint8) StrategyControl->completePasses;
 			buf = GetBufferDescriptor(SieveTick());
 			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 
