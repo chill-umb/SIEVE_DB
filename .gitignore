@@ -18,4 +18,3 @@ objfiles.txt
 *.so
 *.so.*
 *.dylib
-src/interfaces/
