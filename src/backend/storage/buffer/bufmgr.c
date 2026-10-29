@@ -100,6 +100,7 @@ extern void SieveDBOnBufferInsert(BufferDesc *buf);
 extern void LRUOnBufferHit(BufferDesc *buf);
 extern void SieveProtectedOnBufferHit(BufferDesc *buf);
 extern void SieveProtectedOnBufferInsert(BufferDesc *buf);
+extern void TwoQOnBufferHit(BufferDesc *buf);
 extern int  GetUsageCountCap(void);
 
 
@@ -2045,6 +2046,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 				SieveOnBufferHit(buf);
 				LRUOnBufferHit(buf);
 				SieveProtectedOnBufferHit(buf);
+				TwoQOnBufferHit(buf);
 			}
 		}
 		
@@ -2123,6 +2125,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 				SieveOnBufferHit(existing_buf_hdr);
 				LRUOnBufferHit(existing_buf_hdr);
 				SieveProtectedOnBufferHit(existing_buf_hdr);
+				TwoQOnBufferHit(existing_buf_hdr);
 			}
 		}
 

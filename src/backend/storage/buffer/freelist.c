@@ -131,6 +131,7 @@ void SieveOnBufferInsert(BufferDesc *buf);
 void SieveDBOnBufferHit(BufferDesc *buf);
 void SieveDBOnBufferInsert(BufferDesc *buf);
 void LRUOnBufferHit(BufferDesc *buf);
+void TwoQOnBufferHit(BufferDesc *buf);
 void SieveProtectedOnBufferHit(BufferDesc *buf);
 void SieveProtectedOnBufferInsert(BufferDesc *buf);
 int  GetUsageCountCap(void);
@@ -558,8 +559,7 @@ LRUOnBufferHit(BufferDesc *buf)
 {
 	if (StrategyControl->eviction_algorithm != LRU_ALGORITHM && 
 		StrategyControl->eviction_algorithm != CFLRU_ALGORITHM &&
-		StrategyControl->eviction_algorithm != LRUWSR_ALGORITHM &&
-		StrategyControl->eviction_algorithm != TWOQ_ALGORITHM)
+		StrategyControl->eviction_algorithm != LRUWSR_ALGORITHM)
 		return;
 
 	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
@@ -591,6 +591,37 @@ LRUOnBufferHit(BufferDesc *buf)
 	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 }
 
+/*
+ * TwoQOnBufferHit
+ *
+ * Simplified 2Q, on a shared-buffer hit:
+ *  - in Am:   move to the head of Am (normal LRU)
+ *  - in A1in: it was reused, so now promote it to the head of Am
+ */
+void
+TwoQOnBufferHit(BufferDesc *buf)
+{
+	if (StrategyControl->eviction_algorithm != TWOQ_ALGORITHM)
+		return;
+
+	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+	if (buf->twoq_list == TWOQ_AM)
+	{
+		if (StrategyControl->queueHead != buf->buf_id)
+		{
+			TwoQUnlink(buf);
+			TwoQPushAm(buf);
+		}
+	}
+	else if (buf->twoq_list == TWOQ_A1IN)
+	{
+		TwoQUnlink(buf);
+		TwoQPushAm(buf);
+	}
+
+	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+}
 
 /*
  * StrategyGetBuffer
