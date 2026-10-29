@@ -393,7 +393,7 @@ SieveDBOnBufferHit(BufferDesc *buf)
     buf_state = LockBufHdr(buf);
     (void) buf_state;
 
-    /* Protect only on 2nd reuse */
+    /* Protect only on the 2nd reuse */
     if (buf->sieve_visited)
         buf->sieve_protected = true;
 
@@ -1414,6 +1414,13 @@ StrategyInitialize(bool init)
 		StrategyControl->queueTail = POINTER_NOT_IN_QUEUE;
 		StrategyControl->sieveHand = POINTER_NOT_IN_QUEUE;
 
+		
+		/* 2Q initial state: both lists are empty */
+		StrategyControl->a1inHead = POINTER_NOT_IN_QUEUE;
+		StrategyControl->a1inTail = POINTER_NOT_IN_QUEUE;
+		StrategyControl->a1inCount = 0;
+		StrategyControl->amCount = 0;
+
 		/* SIEVE_DB initial state (flags, counters, queues, etc.) */
 		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
 		StrategyControl->sieve_db_all_protected = false;
@@ -1435,7 +1442,13 @@ StrategyInitialize(bool init)
 			buf->queuePrev = POINTER_NOT_IN_QUEUE;
 			buf->queueNext = POINTER_NOT_IN_QUEUE;
 			buf->visited   = false;
-			AddBufferToQueue(buf);
+			buf->twoq_list = TWOQ_NONE;
+
+			/* 2Q: every buffer begins on A1in and other policies use the shared queue */
+			if (eviction_algorithm == TWOQ_ALGORITHM)
+				TwoQPushA1in(buf);
+			else
+				AddBufferToQueue(buf);
 		}
 	}
 	else
