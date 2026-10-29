@@ -14,7 +14,8 @@ enum EvictionAlgorithm
     CFLRU_ALGORITHM,
     LRUWSR_ALGORITHM,
     SIEVE_PROTECTED_ALGORITHM, /* SIEVE + protection bit, no aging */
-    CLOCK_2BIT_ALGORITHM      /* CLOCK with a 2-bit (0-3) reference count */
+    CLOCK_2BIT_ALGORITHM,       /* CLOCK with a 2-bit (0-3) reference count */
+    TWOQ_ALGORITHM             /* 2Q: runs LRU for now */
 };
 
 #define CLOCK_2BIT_MAX_USAGE_COUNT 3

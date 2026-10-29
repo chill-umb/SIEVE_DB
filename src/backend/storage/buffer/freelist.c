@@ -38,6 +38,7 @@ const struct config_enum_entry eviction_algorithm_options[] = {
 	{"lruwsr",   LRUWSR_ALGORITHM,  false},
 	{"sieve_protected", SIEVE_PROTECTED_ALGORITHM, false},
 	{"clock2bit",       CLOCK_2BIT_ALGORITHM,      false},
+	{"two_queue",              TWOQ_ALGORITHM,            false},
     {NULL, 0, false}
 };
 
@@ -475,7 +476,8 @@ LRUOnBufferHit(BufferDesc *buf)
 {
 	if (StrategyControl->eviction_algorithm != LRU_ALGORITHM && 
 		StrategyControl->eviction_algorithm != CFLRU_ALGORITHM &&
-		StrategyControl->eviction_algorithm != LRUWSR_ALGORITHM)
+		StrategyControl->eviction_algorithm != LRUWSR_ALGORITHM &&
+		StrategyControl->eviction_algorithm != TWOQ_ALGORITHM)
 		return;
 
 	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
@@ -860,7 +862,8 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			return buf;
 		}
 	}
-	else if (StrategyControl->eviction_algorithm == LRU_ALGORITHM)
+	else if (StrategyControl->eviction_algorithm == LRU_ALGORITHM || 
+			 StrategyControl->eviction_algorithm == TWOQ_ALGORITHM)
 	{
 		uint32  cur_idx;
 		uint32  local_buf_state;
