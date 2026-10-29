@@ -306,6 +306,82 @@ RemoveBufferFromQueue(BufferDesc *buf)
     buf->queueNext = POINTER_NOT_IN_QUEUE;
 }
 
+/*
+ * 2Q list helpers. Both A1in and Am are doubly linked lists using the
+ * buffer's queuePrev/queueNext links (head = newest, tail = oldest).
+ * A buffer is on at most one list at a time, tracked by buf->twoq_list.
+ * Caller must hold buffer_strategy_lock.
+ */
+static void
+TwoQAddToHead(BufferDesc *buf, int *head, int *tail)
+{
+	buf->queuePrev = POINTER_NOT_IN_QUEUE;
+	buf->queueNext = *head;
+
+	if (*head == POINTER_NOT_IN_QUEUE)
+		*tail = buf->buf_id;	/* list was empty */
+	else
+		GetBufferDescriptor(*head)->queuePrev = buf->buf_id;
+
+	*head = buf->buf_id;
+}
+
+static void
+TwoQRemoveFromList(BufferDesc *buf, int *head, int *tail)
+{
+	if (buf->queuePrev != POINTER_NOT_IN_QUEUE)
+		GetBufferDescriptor(buf->queuePrev)->queueNext = buf->queueNext;
+	else
+		*head = buf->queueNext;		/* buf was the head */
+
+	if (buf->queueNext != POINTER_NOT_IN_QUEUE)
+		GetBufferDescriptor(buf->queueNext)->queuePrev = buf->queuePrev;
+	else
+		*tail = buf->queuePrev;		/* buf was the tail */
+
+	buf->queuePrev = POINTER_NOT_IN_QUEUE;
+	buf->queueNext = POINTER_NOT_IN_QUEUE;
+}
+
+/* Take buf off whichever 2Q list it is on, and fix the count */
+static void
+TwoQUnlink(BufferDesc *buf)
+{
+	if (buf->twoq_list == TWOQ_A1IN)
+	{
+		TwoQRemoveFromList(buf, &StrategyControl->a1inHead,
+						   &StrategyControl->a1inTail);
+		StrategyControl->a1inCount--;
+	}
+	else if (buf->twoq_list == TWOQ_AM)
+	{
+		TwoQRemoveFromList(buf, &StrategyControl->queueHead,
+						   &StrategyControl->queueTail);
+		StrategyControl->amCount--;
+	}
+	buf->twoq_list = TWOQ_NONE;
+}
+
+/* Put buf at the head of A1in. buf must not be on any list. */
+static void
+TwoQPushA1in(BufferDesc *buf)
+{
+	TwoQAddToHead(buf, &StrategyControl->a1inHead,
+				  &StrategyControl->a1inTail);
+	StrategyControl->a1inCount++;
+	buf->twoq_list = TWOQ_A1IN;
+}
+
+/* Put buf at the head of Am. buf must not be on any list. */
+static void
+TwoQPushAm(BufferDesc *buf)
+{
+	TwoQAddToHead(buf, &StrategyControl->queueHead,
+				  &StrategyControl->queueTail);
+	StrategyControl->amCount++;
+	buf->twoq_list = TWOQ_AM;
+}
+
 void
 SieveDBOnBufferHit(BufferDesc *buf)
 {
