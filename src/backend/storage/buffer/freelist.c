@@ -54,6 +54,12 @@ typedef struct
 	int     queueTail;
 	int     sieveHand;
 
+	/* 2Q: A1in list (existing queueHead/queueTail is used as Am) */
+	int a1inHead;
+	int a1inTail;
+	int	a1inCount;   /* current size of A1in list (a1inHead/a1inTail) */
+	int amCount;   /* current size of Am list (queueHead/queueTail) */
+
 
 	/* Spinlock: protects the values below */
 	slock_t		buffer_strategy_lock;

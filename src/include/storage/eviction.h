@@ -19,6 +19,10 @@ enum EvictionAlgorithm
 };
 
 #define CLOCK_2BIT_MAX_USAGE_COUNT 3
+/* 2Q list membership values */
+#define TWOQ_NONE 0
+#define TWOQ_A1IN 1
+#define TWOQ_AM 2
 
 extern void SieveOnBufferHit(BufferDesc *buf);
 extern void SieveDBOnBufferHit(BufferDesc *buf);

@@ -276,6 +276,8 @@ typedef struct BufferDesc
 	bool sieve_visited;
 	bool sieve_protected;
 	uint8 sieve_protect_unvisited_since_pass;
+	/* 2Q: which list this buffer is on (TWOQ_NONE, TWOQ_A1IN, TWOQ_AM) */
+	uint8 twoq_list;	
 
 
 	/*
