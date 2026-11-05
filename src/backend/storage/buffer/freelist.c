@@ -975,8 +975,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			return buf;
 		}
 	}
-	else if (StrategyControl->eviction_algorithm == LRU_ALGORITHM || 
-			 StrategyControl->eviction_algorithm == TWOQ_ALGORITHM)
+	    else if (StrategyControl->eviction_algorithm == LRU_ALGORITHM)
 	{
 		uint32  cur_idx;
 		uint32  local_buf_state;
@@ -1305,6 +1304,81 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			return cur;
 
 		}
+	
+	}
+		else if (StrategyControl->eviction_algorithm == TWOQ_ALGORITHM)
+	{
+		/*
+		 * Simplified 2Q eviction:
+		 *  Step 1. Decide which list to evict from. If A1in holds more than
+		 *          Kin (25% of buffers), evict from A1in. Otherwise evict from Am.
+		 *  Step 2. Walk that list from its tail (oldest) toward its head.
+		 *  Step 3. Skip pinned buffers (someone is using them).
+		 *  Step 4. Take the first unpinned buffer as the victim. Move it to the
+		 *          head of A1in, since the new page will be seen for the first time.
+		 *  Step 5. Pin the victim and return it.
+		 *  If every buffer in the chosen list is pinned, try the other list once.
+		 */
+		int			kin = Max(1, NBuffers / 4);
+
+		for (int pass = 0; pass < 2; pass++)
+		{
+			bool		use_a1in;
+			int			cur_idx;
+			int			scanned = 0;
+
+			/* Step 1: choose the list */
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+			use_a1in = (StrategyControl->a1inCount > kin ||
+						StrategyControl->amCount == 0);
+			if (pass == 1)
+				use_a1in = !use_a1in;
+			cur_idx = use_a1in ? StrategyControl->a1inTail
+							   : StrategyControl->queueTail;
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			/* Step 2: walk from the tail toward the head */
+			while (cur_idx != POINTER_NOT_IN_QUEUE && scanned < NBuffers)
+			{
+				BufferDesc *cur = GetBufferDescriptor(cur_idx);
+				uint32		local_buf_state = LockBufHdr(cur);
+				int			next_idx;
+
+				if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+				{
+					/* Step 4: victim found; the new page starts on A1in */
+					SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+					TwoQUnlink(cur);
+					TwoQPushA1in(cur);
+					SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+					/* Step 5: pin it and release the header lock */
+					UnlockBufHdrExt(cur, local_buf_state, 0, 0, 1);
+
+					local_buf_state = pg_atomic_read_u32(&cur->state);
+					Assert(BUF_STATE_GET_REFCOUNT(local_buf_state) >= 1);
+					*buf_state = local_buf_state;
+
+					if (strategy != NULL)
+						AddBufferToRing(strategy, cur);
+
+					TrackNewBufferPin(BufferDescriptorGetBuffer(cur));
+					return cur;
+				}
+
+				/* Step 3: pinned, so skip it and step toward the head */
+				UnlockBufHdr(cur);
+
+				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+				next_idx = cur->queuePrev;
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+				cur_idx = next_idx;
+				scanned++;
+			}
+		}
+
+		elog(ERROR, "no unpinned buffers available");
 	}
 	else
 	{
