@@ -268,8 +268,8 @@ BufMappingPartitionLockByIndex(uint32 index)
 typedef struct BufferDesc
 {
 	/* SIEVE / LRU family */
-	int     queuePrev;
-	int     queueNext;
+	int     queuePrev;  /* Points to next newer buffer in its list (toward the head) */
+	int     queueNext;  /* Points to next older buffer in its list (toward the tail) */
 	bool    visited;
 
 	/* SIEVE_DB */
@@ -277,7 +277,7 @@ typedef struct BufferDesc
 	bool sieve_protected;
 	uint8 sieve_protect_unvisited_since_pass;
 	/* 2Q: which list this buffer is on (TWOQ_NONE, TWOQ_A1IN, TWOQ_AM) */
-	uint8 twoq_list;	
+	uint8 twoq_list;
 
 
 	/*

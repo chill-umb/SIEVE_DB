@@ -7,15 +7,16 @@
 /* Enum values MUST be visible to guc_tables.c */
 enum EvictionAlgorithm
 {
-    CLOCK_ALGORITHM = 0,
+    CLOCK_ALGORITHM = 0,       /* each policy gets a number: clock = 0 */
+                               /* and each line after it adds 1*/
     SIEVE_ALGORITHM,
     SIEVE_DB_ALGORITHM,
     LRU_ALGORITHM,
     CFLRU_ALGORITHM,
     LRUWSR_ALGORITHM,
     SIEVE_PROTECTED_ALGORITHM, /* SIEVE + protection bit, no aging */
-    CLOCK_2BIT_ALGORITHM,       /* CLOCK with a 2-bit (0-3) reference count */
-    TWOQ_ALGORITHM             /* 2Q: runs LRU for now */
+    CLOCK_2BIT_ALGORITHM,      /* CLOCK with a 2-bit (0-3) reference count */
+    TWOQ_ALGORITHM             /* Our policy; it gets the next number (8) */
 };
 
 #define CLOCK_2BIT_MAX_USAGE_COUNT 3

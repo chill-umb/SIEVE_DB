@@ -14,7 +14,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
 #include "utils/guc.h"
 #include "utils/guc_tables.h" 
 #include "pgstat.h"
@@ -38,8 +37,8 @@ const struct config_enum_entry eviction_algorithm_options[] = {
 	{"lruwsr",   LRUWSR_ALGORITHM,  false},
 	{"sieve_protected", SIEVE_PROTECTED_ALGORITHM, false},
 	{"clock2bit",       CLOCK_2BIT_ALGORITHM,      false},
-	{"two_queue",              TWOQ_ALGORITHM,            false},
-    {NULL, 0, false}
+	{"two_queue",       TWOQ_ALGORITHM,            false},
+    {NULL, 0, false}										/* end marker: the loop stops here */
 };
 
 /*
@@ -47,18 +46,18 @@ const struct config_enum_entry eviction_algorithm_options[] = {
  */
 typedef struct
 {
-	int         eviction_algorithm;
+	int         eviction_algorithm;		/* the active policy's ID, copied at startup */
 
 	/* Queue-based eviction */
-	int     queueHead;
-	int     queueTail;
-	int     sieveHand;
+	int     queueHead;					/* LRU's list head; 2Q uses it as Am's newest buffer */
+	int     queueTail;					/* LRU's list tail ; 2Q uses it as Am's oldest buffer */
+	int     sieveHand;					/* SIEVE only */
 
 	/* 2Q: A1in list (existing queueHead/queueTail is used as Am) */
-	int a1inHead;
-	int a1inTail;
-	int	a1inCount;   /* current size of A1in list (a1inHead/a1inTail) */
-	int amCount;   /* current size of Am list (queueHead/queueTail) */
+	int a1inHead;    /* Newest buffer in A1in */
+	int a1inTail;    /* Oldest buffer in A1in, first one checked for eviction*/
+	int	a1inCount;   /* current size of A1in list */
+	int amCount;     /* current size of Am list */
 
 
 	/* Spinlock: protects the values below */
@@ -313,34 +312,39 @@ RemoveBufferFromQueue(BufferDesc *buf)
  * A buffer is on at most one list at a time, tracked by buf->twoq_list.
  * Caller must hold buffer_strategy_lock.
  */
+
+/* Helper: Links a buffer in at the head of the list */
 static void
 TwoQAddToHead(BufferDesc *buf, int *head, int *tail)
 {
-	buf->queuePrev = POINTER_NOT_IN_QUEUE;
-	buf->queueNext = *head;
+	buf->queuePrev = POINTER_NOT_IN_QUEUE; 				/* nothing is newer than the new head */
+	buf->queueNext = *head;				   				/* old head becomes older neighbor */
 
-	if (*head == POINTER_NOT_IN_QUEUE)
-		*tail = buf->buf_id;	/* list was empty */
+	if (*head == POINTER_NOT_IN_QUEUE)					/* was the list empty? */
+		*tail = buf->buf_id;							/* then I'm also the oldest */
 	else
-		GetBufferDescriptor(*head)->queuePrev = buf->buf_id;
+		GetBufferDescriptor(*head)->queuePrev = buf->buf_id; /* neighbor is now me */
 
-	*head = buf->buf_id;
+	*head = buf->buf_id;									 /* now I'm the new head */
 }
 
+/* Unlinks a buffer from the list by connecting its neighbors */
 static void
 TwoQRemoveFromList(BufferDesc *buf, int *head, int *tail)
 {
-	if (buf->queuePrev != POINTER_NOT_IN_QUEUE)
-		GetBufferDescriptor(buf->queuePrev)->queueNext = buf->queueNext;
-	else
-		*head = buf->queueNext;		/* buf was the head */
+	/* Fix the link coming from the newer side */
+	if (buf->queuePrev != POINTER_NOT_IN_QUEUE)								/* someone is newer than me */
+		GetBufferDescriptor(buf->queuePrev)->queueNext = buf->queueNext;	/* point them past me; was it already there or implemented? */
+	else																	/* I was the head */
+		*head = buf->queueNext;												/* my older neighbor becomes head */
 
-	if (buf->queueNext != POINTER_NOT_IN_QUEUE)
-		GetBufferDescriptor(buf->queueNext)->queuePrev = buf->queuePrev;
-	else
-		*tail = buf->queuePrev;		/* buf was the tail */
+	/* Fix the link coming from the older side */
+	if (buf->queueNext != POINTER_NOT_IN_QUEUE)								/* someone is older than me */		
+		GetBufferDescriptor(buf->queueNext)->queuePrev = buf->queuePrev;	/* point them past me */
+	else																	/* I was the tail */
+		*tail = buf->queuePrev;												/* my newer neighbor becomes tail */
 
-	buf->queuePrev = POINTER_NOT_IN_QUEUE;
+	buf->queuePrev = POINTER_NOT_IN_QUEUE;	/* clears my own links so I'm not on any list */
 	buf->queueNext = POINTER_NOT_IN_QUEUE;
 }
 
@@ -348,7 +352,7 @@ TwoQRemoveFromList(BufferDesc *buf, int *head, int *tail)
 static void
 TwoQUnlink(BufferDesc *buf)
 {
-	if (buf->twoq_list == TWOQ_A1IN)
+	if (buf->twoq_list == TWOQ_A1IN) /* where is twoq_list set? */
 	{
 		TwoQRemoveFromList(buf, &StrategyControl->a1inHead,
 						   &StrategyControl->a1inTail);
@@ -370,7 +374,7 @@ TwoQPushA1in(BufferDesc *buf)
 	TwoQAddToHead(buf, &StrategyControl->a1inHead,
 				  &StrategyControl->a1inTail);
 	StrategyControl->a1inCount++;
-	buf->twoq_list = TWOQ_A1IN;
+	buf->twoq_list = TWOQ_A1IN; /* two_qlist set here */
 }
 
 /* Put buf at the head of Am. buf must not be on any list. */
@@ -380,7 +384,7 @@ TwoQPushAm(BufferDesc *buf)
 	TwoQAddToHead(buf, &StrategyControl->queueHead,
 				  &StrategyControl->queueTail);
 	StrategyControl->amCount++;
-	buf->twoq_list = TWOQ_AM;
+	buf->twoq_list = TWOQ_AM; /* two_qlist set here */
 }
 
 void
@@ -1319,13 +1323,13 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		 *  Step 5. Pin the victim and return it.
 		 *  If every buffer in the chosen list is pinned, try the other list once.
 		 */
-		int			kin = Max(1, NBuffers / 4);
+		int			kin = Max(1, NBuffers / 4); /* A1in's target size: 25% of buffers */
 
-		for (int pass = 0; pass < 2; pass++)
+		for (int pass = 0; pass < 2; pass++) /* 0 = try preferred list, 1 = if every buffer there was pinned, try the other list */
 		{
-			bool		use_a1in;
+			bool		use_a1in;     /* True if evicting from A1in, false if from Am */
 			int			cur_idx;
-			int			scanned = 0;
+			int			scanned = 0;  /* Safety counter so a scan never loops forever */
 
 			/* Step 1: choose the list */
 			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
